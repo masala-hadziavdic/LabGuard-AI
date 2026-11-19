@@ -45,8 +45,3 @@ Thumbs.db
 *.csv
 *.xlsx
 
-# =========================
-# RAG generated files
-# =========================
-rag/faiss_index.bin
-rag/metadata.pkl
