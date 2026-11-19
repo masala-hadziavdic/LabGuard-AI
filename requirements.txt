@@ -1,0 +1,10 @@
+streamlit
+pandas
+matplotlib
+fastapi
+uvicorn
+faiss-cpu
+python-dotenv
+sentence-transformers
+langchain-mistralai
+python-docx
