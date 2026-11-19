@@ -1,6 +1,6 @@
-# Dedicated dependencies for the GitHub Actions RAGAS evaluation.
-# Versions aligned with the working RAG_LLM.ipynb environment.
 faiss-cpu
+numpy==1.26.4
+pyarrow==17.0.0
 sentence-transformers
 datasets==5.0.0
 ragas==0.1.9
