@@ -25,24 +25,26 @@ from ragas.metrics import (
 
 ROOT = Path(__file__).resolve().parent
 RAG_DIR = ROOT / "rag"
+
 INDEX_PATH = RAG_DIR / "faiss_index.bin"
 METADATA_PATH = RAG_DIR / "metadata.pkl"
 
 OUTPUT_DIR = ROOT / "rag-evaluation-results"
-OUTPUT_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 TOP_K = 3
 
-# Limitation des appels RAGAS pour éviter les erreurs HTTP 429
+# Limitation de la concurrence et gestion des erreurs temporaires
 RUN_CONFIG = RunConfig(
     timeout=180,
     max_workers=1,
     max_retries=5,
     max_wait=60,
-    log_tenacity=True,
-)
+    log_tenacity=True,)
 
+# Pause entre les appels directs à Mistral
+GENERATION_PAUSE = 3
 
 # ============================================================
 # DATASET : 15 QUESTIONS D'EVALUATION
@@ -126,7 +128,6 @@ EVALUATION_DATA = [
     },
 ]
 
-
 # ============================================================
 # LOCAL EMBEDDINGS
 # ============================================================
@@ -141,17 +142,58 @@ class LocalSentenceTransformerEmbeddings(Embeddings):
         vectors = self.model.encode(
             texts,
             convert_to_numpy=True,
-            normalize_embeddings=True,
-        )
+            normalize_embeddings=True,)
         return vectors.tolist()
 
     def embed_query(self, text):
         vector = self.model.encode(
             [text],
             convert_to_numpy=True,
-            normalize_embeddings=True,
-        )[0]
+            normalize_embeddings=True,)[0]
         return vector.tolist()
+
+# ============================================================
+# CSV SAVING
+# ============================================================
+
+def save_detailed_results(rows):
+    """Save generated answers and retrieval details."""
+
+    if not rows:
+        return
+
+    output_path = OUTPUT_DIR / "answers_and_retrieval.csv"
+
+    with output_path.open(
+        "w",
+        newline="",
+        encoding="utf-8-sig",) as f:
+
+        writer = csv.DictWriter(f,
+            fieldnames=rows[0].keys(),)
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ============================================================
+# SAFE METRIC AVERAGE
+# ============================================================
+
+def safe_mean(dataframe, column):
+    """Calculate a metric average while ignoring missing values."""
+
+    if column not in dataframe.columns:
+        return None
+
+    values = dataframe[column].replace(
+        [np.inf, -np.inf],
+        np.nan,).dropna()
+
+    if values.empty:
+        return None
+
+    return float(values.mean())
 
 
 # ============================================================
@@ -188,8 +230,10 @@ def main():
         raise ValueError(
             f"Index/metadata mismatch: "
             f"{index.ntotal} vectors vs "
-            f"{len(metadata)} metadata entries."
-        )
+            f"{len(metadata)} metadata entries.")
+
+    if index.ntotal == 0:
+        raise ValueError("The FAISS index is empty.")
 
     print(f"Loaded {index.ntotal} vectors.")
     print(f"Loaded {len(metadata)} metadata entries.")
@@ -250,8 +294,7 @@ def main():
     generation_rows = []
     detailed_rows = []
 
-    print(
-        f"\nRunning retrieval and generation "
+    print(f"\nRunning retrieval and generation "
         f"for {len(EVALUATION_DATA)} questions...")
 
     for number, item in enumerate(EVALUATION_DATA, start=1):
@@ -289,22 +332,31 @@ RETRIEVED DOCUMENTS:
 ANSWER:
 """
 
-        answer = mistral_llm.invoke(prompt).content
+        # Generate answer
+        answer_response = mistral_llm.invoke(prompt)
+        answer = answer_response.content
 
+        if isinstance(answer, list):
+            answer = " ".join(
+                str(part) for part in answer)
+
+        answer = str(answer)
+
+        # RAGAS retrieval dataset
         retrieval_rows.append({
             "question": question,
             "contexts": [
                 r.get("text", "") for r in retrieved],
             "ground_truth": item["ground_truth"],})
 
+        # RAGAS generation dataset
         generation_rows.append({
             "question": question,
             "contexts": contexts,
             "answer": answer,
             "ground_truth": item["ground_truth"],})
 
-        retrieved_sources = [
-            r.get("source") for r in retrieved]
+        retrieved_sources = [r.get("source") for r in retrieved]
 
         source_hit = (item["expected_source"] in retrieved_sources)
 
@@ -317,24 +369,46 @@ ANSWER:
             "expected_source_in_top3": source_hit,
             "answer": answer,})
 
-        print(
-            f"[{number}/{len(EVALUATION_DATA)}] "
+        # Save intermediate results after every question
+        save_detailed_results(detailed_rows)
+
+        print(f"[{number}/{len(EVALUATION_DATA)}] "
             f"Answer generated; "
             f"expected source in top 3: {source_hit}")
 
-        # Small pause to reduce request frequency
+        # Pause to reduce API request frequency
         if number < len(EVALUATION_DATA):
-            time.sleep(1.5)
+            time.sleep(GENERATION_PAUSE)
 
     # --------------------------------------------------------
-    # 7. INITIALIZE LOCAL EMBEDDINGS FOR RAGAS
+    # 7. SAVE DATASETS FOR TRACEABILITY
+    # --------------------------------------------------------
+
+    with (OUTPUT_DIR / "retrieval_dataset.json").open(
+        "w",
+        encoding="utf-8",) as f:
+        json.dump(retrieval_rows,
+            f,
+            indent=2,
+            ensure_ascii=False,)
+
+    with (OUTPUT_DIR / "generation_dataset.json").open(
+        "w",
+        encoding="utf-8",) as f:
+        json.dump(generation_rows,
+            f,
+            indent=2,
+            ensure_ascii=False,)
+
+    # --------------------------------------------------------
+    # 8. INITIALIZE LOCAL EMBEDDINGS FOR RAGAS
     # --------------------------------------------------------
 
     local_embeddings = LocalSentenceTransformerEmbeddings(
         embedding_model)
 
     # --------------------------------------------------------
-    # 8. RAGAS RETRIEVAL EVALUATION
+    # 9. RAGAS RETRIEVAL EVALUATION
     # --------------------------------------------------------
 
     print("\nRunning RAGAS retrieval metrics...")
@@ -345,8 +419,7 @@ ANSWER:
 
     retrieval_result = evaluate(
         dataset=retrieval_dataset,
-        metrics=[
-            context_precision,
+        metrics=[context_precision,
             context_recall,],
         llm=mistral_llm,
         is_async=False,
@@ -354,14 +427,13 @@ ANSWER:
 
     retrieval_df = retrieval_result.to_pandas()
 
-    retrieval_df.to_csv(
-        OUTPUT_DIR / "retrieval_metrics_per_question.csv",
+    retrieval_df.to_csv(OUTPUT_DIR / "retrieval_metrics_per_question.csv",
         index=False,)
 
     print("\nRetrieval evaluation completed.")
 
     # --------------------------------------------------------
-    # 9. RAGAS GENERATION EVALUATION
+    # 10. RAGAS GENERATION EVALUATION
     # --------------------------------------------------------
 
     print("\nRunning RAGAS generation metrics...")
@@ -373,8 +445,7 @@ ANSWER:
 
     generation_result = evaluate(
         dataset=generation_dataset,
-        metrics=[
-            faithfulness,
+        metrics=[faithfulness,
             answer_relevancy,
             answer_correctness,],
         llm=mistral_llm,
@@ -391,23 +462,12 @@ ANSWER:
     print("\nGeneration evaluation completed.")
 
     # --------------------------------------------------------
-    # 10. SAVE ANSWERS AND RETRIEVAL DETAILS
-    # --------------------------------------------------------
-
-    with (OUTPUT_DIR / "answers_and_retrieval.csv").open(
-        "w",
-        newline="",
-        encoding="utf-8-sig",) as f:
-
-        writer = csv.DictWriter(f,
-            fieldnames=detailed_rows[0].keys(),)
-
-        writer.writeheader()
-        writer.writerows(detailed_rows)
-
-    # --------------------------------------------------------
     # 11. CALCULATE SUMMARY
     # --------------------------------------------------------
+
+    source_hit_rate = float(
+        np.mean([row["expected_source_in_top3"]
+            for row in detailed_rows]))
 
     summary = {
         "questions_evaluated": len(EVALUATION_DATA),
@@ -417,34 +477,34 @@ ANSWER:
         "ragas_version": "0.1.9",
 
         "retrieval_metrics": {
-            "context_precision": float(
-                retrieval_df["context_precision"].mean()),
-            "context_recall": float(
-                retrieval_df["context_recall"].mean()),},
+            "context_precision": safe_mean(
+                retrieval_df,
+                "context_precision",),
+            "context_recall": safe_mean(
+                retrieval_df,
+                "context_recall",),},
 
         "generation_metrics": {
-            "faithfulness": float(
-                generation_df["faithfulness"].mean()),
-            "answer_relevancy": float(
-                generation_df["answer_relevancy"].mean()),
-            "answer_correctness": float(
-                generation_df["answer_correctness"].mean()),},
+            "faithfulness": safe_mean(
+                generation_df,
+                "faithfulness",),
+            "answer_relevancy": safe_mean(
+                generation_df,
+                "answer_relevancy",),
+            "answer_correctness": safe_mean(
+                generation_df,
+                "answer_correctness",),},
 
-        "source_hit_rate_at_3": float(
-            np.mean([
-                row["expected_source_in_top3"]
-                for row in detailed_rows])),}
+        "source_hit_rate_at_3": source_hit_rate,}
 
     # --------------------------------------------------------
     # 12. SAVE SUMMARY JSON
     # --------------------------------------------------------
 
-    with (OUTPUT_DIR / "ragas_summary.json").open(
-        "w",
+    with (OUTPUT_DIR / "ragas_summary.json").open("w",
         encoding="utf-8",) as f:
 
-        json.dump(
-            summary,
+        json.dump(summary,
             f,
             indent=2,
             ensure_ascii=False,)
