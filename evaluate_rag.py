@@ -1,54 +1,57 @@
+"""LabGuard AI - RAGAS evaluation (RAGAS 0.4.3).
+
+This evaluation environment is intentionally separate from the main app.
+Generation and judging both use Mistral's OpenAI-compatible API.
+Embeddings for RAGAS use the same local Sentence Transformer as FAISS retrieval.
+"""
+
 import csv
 import json
+import math
 import os
 import pickle
 import time
 from pathlib import Path
+
 import faiss
 import numpy as np
-from datasets import Dataset
 from sentence_transformers import SentenceTransformer
+from openai import OpenAI, AsyncOpenAI
 from langchain_core.embeddings import Embeddings
-from langchain_mistralai import ChatMistralAI
+
 from ragas import evaluate
+from ragas.dataset_schema import EvaluationDataset, SingleTurnSample
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from ragas.llms import llm_factory
 from ragas.run_config import RunConfig
 from ragas.metrics import (
-    context_precision,
-    context_recall,
-    faithfulness,
-    answer_relevancy,
-    answer_correctness,)
-
-# ============================================================
-# CONFIGURATION
-# ============================================================
+    Faithfulness,
+    AnswerRelevancy,
+    AnswerCorrectness,
+    ContextPrecision,
+    ContextRecall,)
 
 ROOT = Path(__file__).resolve().parent
 RAG_DIR = ROOT / "rag"
-
 INDEX_PATH = RAG_DIR / "faiss_index.bin"
 METADATA_PATH = RAG_DIR / "metadata.pkl"
-
 OUTPUT_DIR = ROOT / "rag-evaluation-results"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 TOP_K = 3
+MISTRAL_BASE_URL = "https://api.mistral.ai/v1"
+GENERATION_MODEL = "mistral-small-latest"
+EVALUATOR_MODEL = "mistral-small-latest"
+GENERATION_PAUSE_SECONDS = 2.0
 
-# Limitation de la concurrence et gestion des erreurs temporaires
+# One RAGAS worker avoids bursts of simultaneous requests to the Mistral API.
 RUN_CONFIG = RunConfig(
     timeout=180,
     max_workers=1,
-    max_retries=5,
+    max_retries=4,
     max_wait=60,
     log_tenacity=True,)
-
-# Pause entre les appels directs à Mistral
-GENERATION_PAUSE = 3
-
-# ============================================================
-# DATASET : 15 QUESTIONS D'EVALUATION
-# ============================================================
 
 EVALUATION_DATA = [
     {
@@ -128,196 +131,120 @@ EVALUATION_DATA = [
     },
 ]
 
-# ============================================================
-# LOCAL EMBEDDINGS
-# ============================================================
+
 
 class LocalSentenceTransformerEmbeddings(Embeddings):
-    """RAGAS embeddings using the local Sentence Transformer."""
+    """LangChain-compatible wrapper around the local retrieval embedding model."""
 
     def __init__(self, model):
         self.model = model
 
     def embed_documents(self, texts):
         vectors = self.model.encode(
-            texts,
-            convert_to_numpy=True,
-            normalize_embeddings=True,)
+            texts, convert_to_numpy=True, normalize_embeddings=True)
         return vectors.tolist()
 
     def embed_query(self, text):
         vector = self.model.encode(
-            [text],
-            convert_to_numpy=True,
-            normalize_embeddings=True,)[0]
+            [text], convert_to_numpy=True, normalize_embeddings=True)[0]
         return vector.tolist()
 
-# ============================================================
-# CSV SAVING
-# ============================================================
 
-def save_detailed_results(rows):
-    """Save generated answers and retrieval details."""
+def safe_mean(values):
+    clean = []
+    for value in values:
+        try:
+            number = float(value)
+            if math.isfinite(number):
+                clean.append(number)
+        except (TypeError, ValueError):
+            continue
+    return float(np.mean(clean)) if clean else None
 
-    if not rows:
-        return
-
-    output_path = OUTPUT_DIR / "answers_and_retrieval.csv"
-
-    with output_path.open(
-        "w",
-        newline="",
-        encoding="utf-8-sig",) as f:
-
-        writer = csv.DictWriter(f,
-            fieldnames=rows[0].keys(),)
-
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-# ============================================================
-# SAFE METRIC AVERAGE
-# ============================================================
-
-def safe_mean(dataframe, column):
-    """Calculate a metric average while ignoring missing values."""
-
-    if column not in dataframe.columns:
-        return None
-
-    values = dataframe[column].replace(
-        [np.inf, -np.inf],
-        np.nan,).dropna()
-
-    if values.empty:
-        return None
-
-    return float(values.mean())
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
-
-    # --------------------------------------------------------
-    # 1. CHECK API KEY AND FILES
-    # --------------------------------------------------------
-
-    if not os.getenv("MISTRAL_API_KEY"):
+    api_key = os.getenv("MISTRAL_API_KEY")
+    if not api_key:
         raise RuntimeError(
-            "MISTRAL_API_KEY is not set. "
-            "Add it as a GitHub Actions secret.")
+            "MISTRAL_API_KEY is missing. Add it to GitHub Actions secrets.")
 
     if not INDEX_PATH.exists() or not METADATA_PATH.exists():
         raise FileNotFoundError(
-            "Expected rag/faiss_index.bin and rag/metadata.pkl.")
+            "Expected rag/faiss_index.bin and rag/metadata.pkl in the repository.")
 
-    # --------------------------------------------------------
-    # 2. LOAD FAISS INDEX AND METADATA
-    # --------------------------------------------------------
-
-    print("\nLoading FAISS index and metadata...")
-
+    print("Loading FAISS index and metadata...")
     index = faiss.read_index(str(INDEX_PATH))
-
-    with METADATA_PATH.open("rb") as f:
-        metadata = pickle.load(f)
+    with METADATA_PATH.open("rb") as file:
+        metadata = pickle.load(file)
 
     if index.ntotal != len(metadata):
         raise ValueError(
-            f"Index/metadata mismatch: "
-            f"{index.ntotal} vectors vs "
-            f"{len(metadata)} metadata entries.")
-
+            f"FAISS/metadata mismatch: {index.ntotal} vectors vs "
+            f"{len(metadata)} metadata records.")
     if index.ntotal == 0:
         raise ValueError("The FAISS index is empty.")
 
-    print(f"Loaded {index.ntotal} vectors.")
-    print(f"Loaded {len(metadata)} metadata entries.")
-
-    # --------------------------------------------------------
-    # 3. LOAD EMBEDDING MODEL
-    # --------------------------------------------------------
-
-    print("\nLoading Sentence Transformer...")
-
+    print(f"Loaded {index.ntotal} vectors and {len(metadata)} metadata records.")
+    print(f"Loading embedding model: {MODEL_NAME}")
     embedding_model = SentenceTransformer(MODEL_NAME)
 
-    # --------------------------------------------------------
-    # 4. FAISS RETRIEVAL FUNCTION
-    # --------------------------------------------------------
-
     def faiss_search(question, top_k=TOP_K):
-
-        query_embedding = embedding_model.encode(
+        query_vector = embedding_model.encode(
             [question],
             convert_to_numpy=True,
             normalize_embeddings=True,).astype("float32")
-
-        scores, indices = index.search(
-            query_embedding,
-            min(top_k, index.ntotal),)
-
-        results = []
-
+        scores, indices = index.search(query_vector, min(top_k, index.ntotal))
+        retrieved = []
         for score, idx in zip(scores[0], indices[0]):
-
-            if idx == -1:
+            if idx < 0:
                 continue
-
             item = metadata[int(idx)].copy()
             item["similarity_score"] = float(score)
+            retrieved.append(item)
+        return retrieved
 
-            results.append(item)
+    # OpenAI-compatible Mistral client for producing LabGuard answers.
+    generation_client = OpenAI(
+        api_key=api_key,
+        base_url=MISTRAL_BASE_URL,
+        timeout=120.0,
+        max_retries=4,)
 
-        return results
+    # Separate asynchronous client for RAGAS judge calls. This avoids
+    # ChatMistralAI's LangChain token-usage aggregation path that failed before.
+    evaluator_client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=MISTRAL_BASE_URL,
+        timeout=180.0,
+        max_retries=4,)
+    evaluator_llm = llm_factory(
+        EVALUATOR_MODEL,
+        provider="openai",
+        client=evaluator_client,)
 
-    # --------------------------------------------------------
-    # 5. INITIALIZE MISTRAL
-    # --------------------------------------------------------
+    local_embeddings = LangchainEmbeddingsWrapper(
+        LocalSentenceTransformerEmbeddings(embedding_model),
+        run_config=RUN_CONFIG,)
 
-    print("\nInitializing Mistral...")
-
-    mistral_llm = ChatMistralAI(
-        model="mistral-small-latest",
-        temperature=0,
-        max_retries=5,)
-
-    # --------------------------------------------------------
-    # 6. GENERATE ANSWERS AND RETRIEVE CONTEXTS
-    # --------------------------------------------------------
-
-    retrieval_rows = []
-    generation_rows = []
+    samples = []
     detailed_rows = []
-
-    print(f"\nRunning retrieval and generation "
-        f"for {len(EVALUATION_DATA)} questions...")
+    print(f"Generating answers for {len(EVALUATION_DATA)} questions...")
 
     for number, item in enumerate(EVALUATION_DATA, start=1):
-
         question = item["question"]
-
         retrieved = faiss_search(question, TOP_K)
-
-        contexts = [(f"[Source: {r.get('source', 'Unknown')} "
-                f"| Chunk: {r.get('chunk_id', 'Unknown')}]\n"
-                f"{r.get('text', '')}")
-            for r in retrieved]
-
-        context_text = "\n\n".join(contexts)
+        contexts = [
+            f"[Source: {r.get('source', 'Unknown')} | "
+            f"Chunk: {r.get('chunk_id', 'Unknown')}]\n{r.get('text', '')}"
+            for r in retrieved
+            if r.get("text")]
 
         prompt = f"""You are LabGuard AI, a laboratory quality document assistant.
-
 Answer the question using ONLY the information in the retrieved documents.
-
 Rules:
 - Do not invent information.
 - Do not use external knowledge.
-- If the documents do not contain enough information, clearly say that the information is not available.
+- If the documents do not contain enough information, say that the information is not available.
 - Distinguish a suspected cause from a confirmed cause.
 - Do not make clinical decisions.
 - Answer in the same language as the question.
@@ -327,210 +254,107 @@ QUESTION:
 {question}
 
 RETRIEVED DOCUMENTS:
-{context_text}
+{chr(10).join(contexts)}
 
 ANSWER:
 """
 
-        # Generate answer
-        answer_response = mistral_llm.invoke(prompt)
-        answer = answer_response.content
+        completion = generation_client.chat.completions.create(
+            model=GENERATION_MODEL,
+            messages=[
+                {"role": "system", "content": "You are LabGuard AI."},
+                {"role": "user", "content": prompt},],
+            temperature=0,)
+        answer = completion.choices[0].message.content or ""
+        if not answer.strip():
+            raise RuntimeError(f"Mistral returned an empty answer for question {number}.")
 
-        if isinstance(answer, list):
-            answer = " ".join(
-                str(part) for part in answer)
+        samples.append(
+            SingleTurnSample(
+                user_input=question,
+                response=answer,
+                retrieved_contexts=[r.get("text", "") for r in retrieved if r.get("text")],
+                reference=item["ground_truth"],))
 
-        answer = str(answer)
-
-        # RAGAS retrieval dataset
-        retrieval_rows.append({
-            "question": question,
-            "contexts": [
-                r.get("text", "") for r in retrieved],
-            "ground_truth": item["ground_truth"],})
-
-        # RAGAS generation dataset
-        generation_rows.append({
-            "question": question,
-            "contexts": contexts,
-            "answer": answer,
-            "ground_truth": item["ground_truth"],})
-
-        retrieved_sources = [r.get("source") for r in retrieved]
-
-        source_hit = (item["expected_source"] in retrieved_sources)
-
+        retrieved_sources = [r.get("source", "Unknown") for r in retrieved]
+        source_hit = item["expected_source"] in retrieved_sources
         detailed_rows.append({
             "question_number": number,
             "question": question,
             "expected_source": item["expected_source"],
-            "retrieved_sources": " | ".join(
-                str(s) for s in retrieved_sources),
+            "retrieved_sources": " | ".join(str(s) for s in retrieved_sources),
             "expected_source_in_top3": source_hit,
             "answer": answer,})
 
-        # Save intermediate results after every question
-        save_detailed_results(detailed_rows)
+        # Save partial results after each answer, so a later failure does not
+        # discard the already generated answers.
+        with (OUTPUT_DIR / "answers_and_retrieval.csv").open(
+            "w", newline="", encoding="utf-8-sig") as file:
+            writer = csv.DictWriter(file, fieldnames=detailed_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(detailed_rows)
 
-        print(f"[{number}/{len(EVALUATION_DATA)}] "
-            f"Answer generated; "
+        print(f"[{number}/{len(EVALUATION_DATA)}] Answer generated; "
             f"expected source in top 3: {source_hit}")
-
-        # Pause to reduce API request frequency
         if number < len(EVALUATION_DATA):
-            time.sleep(GENERATION_PAUSE)
+            time.sleep(GENERATION_PAUSE_SECONDS)
 
-    # --------------------------------------------------------
-    # 7. SAVE DATASETS FOR TRACEABILITY
-    # --------------------------------------------------------
+    evaluation_dataset = EvaluationDataset(samples=samples)
+    print("RAGAS dataset ready:", len(samples), "samples")
+    print("Running five RAGAS metrics with one worker...")
 
-    with (OUTPUT_DIR / "retrieval_dataset.json").open(
-        "w",
-        encoding="utf-8",) as f:
-        json.dump(retrieval_rows,
-            f,
-            indent=2,
-            ensure_ascii=False,)
+    metrics = [
+        Faithfulness(llm=evaluator_llm),
+        AnswerRelevancy(llm=evaluator_llm, embeddings=local_embeddings),
+        AnswerCorrectness(llm=evaluator_llm, embeddings=local_embeddings),
+        ContextPrecision(llm=evaluator_llm),
+        ContextRecall(llm=evaluator_llm),]
 
-    with (OUTPUT_DIR / "generation_dataset.json").open(
-        "w",
-        encoding="utf-8",) as f:
-        json.dump(generation_rows,
-            f,
-            indent=2,
-            ensure_ascii=False,)
+    result = evaluate(
+        dataset=evaluation_dataset,
+        metrics=metrics,
+        run_config=RUN_CONFIG,
+        raise_exceptions=True,
+        show_progress=True,)
 
-    # --------------------------------------------------------
-    # 8. INITIALIZE LOCAL EMBEDDINGS FOR RAGAS
-    # --------------------------------------------------------
+    results_df = result.to_pandas()
+    results_df.to_csv(
+        OUTPUT_DIR / "ragas_metrics_per_question.csv",
+        index=False,
+        encoding="utf-8-sig",)
 
-    local_embeddings = LocalSentenceTransformerEmbeddings(
-        embedding_model)
-
-    # --------------------------------------------------------
-    # 9. RAGAS RETRIEVAL EVALUATION
-    # --------------------------------------------------------
-
-    print("\nRunning RAGAS retrieval metrics...")
-    print("Metrics: Context Precision and Context Recall")
-    print("Maximum concurrent workers: 1")
-
-    retrieval_dataset = Dataset.from_list(retrieval_rows)
-
-    retrieval_result = evaluate(
-        dataset=retrieval_dataset,
-        metrics=[context_precision,
-            context_recall,],
-        llm=mistral_llm,
-        is_async=False,
-        run_config=RUN_CONFIG,)
-
-    retrieval_df = retrieval_result.to_pandas()
-
-    retrieval_df.to_csv(OUTPUT_DIR / "retrieval_metrics_per_question.csv",
-        index=False,)
-
-    print("\nRetrieval evaluation completed.")
-
-    # --------------------------------------------------------
-    # 10. RAGAS GENERATION EVALUATION
-    # --------------------------------------------------------
-
-    print("\nRunning RAGAS generation metrics...")
-    print("Metrics: Faithfulness, Answer Relevancy "
-        "and Answer Correctness")
-    print("Maximum concurrent workers: 1")
-
-    generation_dataset = Dataset.from_list(generation_rows)
-
-    generation_result = evaluate(
-        dataset=generation_dataset,
-        metrics=[faithfulness,
-            answer_relevancy,
-            answer_correctness,],
-        llm=mistral_llm,
-        embeddings=local_embeddings,
-        is_async=False,
-        run_config=RUN_CONFIG,)
-
-    generation_df = generation_result.to_pandas()
-
-    generation_df.to_csv(
-        OUTPUT_DIR / "generation_metrics_per_question.csv",
-        index=False,)
-
-    print("\nGeneration evaluation completed.")
-
-    # --------------------------------------------------------
-    # 11. CALCULATE SUMMARY
-    # --------------------------------------------------------
-
-    source_hit_rate = float(
-        np.mean([row["expected_source_in_top3"]
-            for row in detailed_rows]))
-
+    metric_columns = [
+        "faithfulness",
+        "answer_relevancy",
+        "answer_correctness",
+        "context_precision",
+        "context_recall",]
     summary = {
-        "questions_evaluated": len(EVALUATION_DATA),
+        "questions_evaluated": len(samples),
         "top_k": TOP_K,
         "embedding_model": MODEL_NAME,
-        "mistral_model": "mistral-small-latest",
-        "ragas_version": "0.1.9",
+        "generation_model": GENERATION_MODEL,
+        "evaluator_model": EVALUATOR_MODEL,
+        "ragas_version": "0.4.3",
+        "metrics": {},
+        "source_hit_rate_at_3": float(
+            np.mean([row["expected_source_in_top3"] for row in detailed_rows])),}
 
-        "retrieval_metrics": {
-            "context_precision": safe_mean(
-                retrieval_df,
-                "context_precision",),
-            "context_recall": safe_mean(
-                retrieval_df,
-                "context_recall",),},
+    for metric_name in metric_columns:
+        if metric_name not in results_df.columns:
+            raise KeyError(
+                f"Expected RAGAS metric column '{metric_name}' was not returned. "
+                f"Available columns: {list(results_df.columns)}"
+            )
+        summary["metrics"][metric_name] = safe_mean(results_df[metric_name])
 
-        "generation_metrics": {
-            "faithfulness": safe_mean(
-                generation_df,
-                "faithfulness",),
-            "answer_relevancy": safe_mean(
-                generation_df,
-                "answer_relevancy",),
-            "answer_correctness": safe_mean(
-                generation_df,
-                "answer_correctness",),},
+    with (OUTPUT_DIR / "ragas_summary.json").open("w", encoding="utf-8") as file:
+        json.dump(summary, file, indent=2, ensure_ascii=False)
 
-        "source_hit_rate_at_3": source_hit_rate,}
+    print("\n=== LABGUARD AI RAGAS SUMMARY ===")
+    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print(f"\nEvaluation files saved in: {OUTPUT_DIR}")
 
-    # --------------------------------------------------------
-    # 12. SAVE SUMMARY JSON
-    # --------------------------------------------------------
-
-    with (OUTPUT_DIR / "ragas_summary.json").open("w",
-        encoding="utf-8",) as f:
-
-        json.dump(summary,
-            f,
-            indent=2,
-            ensure_ascii=False,)
-
-    # --------------------------------------------------------
-    # 13. DISPLAY FINAL RESULTS
-    # --------------------------------------------------------
-
-    print("\n========================================")
-    print("       LABGUARD AI RAGAS SUMMARY")
-    print("========================================")
-
-    print(json.dumps(
-            summary,
-            indent=2,
-            ensure_ascii=False,))
-
-    print("\nEvaluation files saved in:")
-    print(OUTPUT_DIR)
-
-    print("\nRAGAS EVALUATION COMPLETED SUCCESSFULLY.")
-
-
-# ============================================================
-# EXECUTION
-# ============================================================
 
 if __name__ == "__main__":
     main()
