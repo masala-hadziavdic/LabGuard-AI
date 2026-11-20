@@ -1,6 +1,8 @@
 faiss-cpu==1.10.0
 numpy==1.26.4
+pyarrow==25.0.1
 sentence-transformers
+datasets>=4.0.0
 ragas==0.4.3
 openai==1.75.0
 langchain-core==0.3.51
