@@ -234,6 +234,8 @@ def main():
         EVALUATOR_MODEL,
         provider="openai",
         client=evaluator_client,
+        max_tokens=4096,
+        temperature=0.0,
     )
 
     local_embeddings = LangchainEmbeddingsWrapper(
