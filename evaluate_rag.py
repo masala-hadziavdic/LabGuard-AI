@@ -236,6 +236,7 @@ def main():
         client=evaluator_client,
         max_tokens=4096,
         temperature=0.0,
+        top_p=1.0,
     )
 
     local_embeddings = LangchainEmbeddingsWrapper(
