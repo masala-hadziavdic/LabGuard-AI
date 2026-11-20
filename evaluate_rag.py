@@ -29,7 +29,8 @@ from ragas.metrics import (
     AnswerRelevancy,
     AnswerCorrectness,
     ContextPrecision,
-    ContextRecall,)
+    ContextRecall,
+)
 
 ROOT = Path(__file__).resolve().parent
 RAG_DIR = ROOT / "rag"
@@ -51,7 +52,8 @@ RUN_CONFIG = RunConfig(
     max_workers=1,
     max_retries=4,
     max_wait=60,
-    log_tenacity=True,)
+    log_tenacity=True,
+)
 
 EVALUATION_DATA = [
     {
@@ -137,16 +139,21 @@ class LocalSentenceTransformerEmbeddings(Embeddings):
     """LangChain-compatible wrapper around the local retrieval embedding model."""
 
     def __init__(self, model):
-        self.model = model
+        # IMPORTANT: do not name this attribute `model`.
+        # RAGAS 0.4.3 LangchainEmbeddingsWrapper reads `.model` for telemetry
+        # and expects a string. SentenceTransformer stores a model object.
+        self.encoder = model
 
     def embed_documents(self, texts):
-        vectors = self.model.encode(
-            texts, convert_to_numpy=True, normalize_embeddings=True)
+        vectors = self.encoder.encode(
+            texts, convert_to_numpy=True, normalize_embeddings=True
+        )
         return vectors.tolist()
 
     def embed_query(self, text):
-        vector = self.model.encode(
-            [text], convert_to_numpy=True, normalize_embeddings=True)[0]
+        vector = self.encoder.encode(
+            [text], convert_to_numpy=True, normalize_embeddings=True
+        )[0]
         return vector.tolist()
 
 
@@ -166,11 +173,13 @@ def main():
     api_key = os.getenv("MISTRAL_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "MISTRAL_API_KEY is missing. Add it to GitHub Actions secrets.")
+            "MISTRAL_API_KEY is missing. Add it to GitHub Actions secrets."
+        )
 
     if not INDEX_PATH.exists() or not METADATA_PATH.exists():
         raise FileNotFoundError(
-            "Expected rag/faiss_index.bin and rag/metadata.pkl in the repository.")
+            "Expected rag/faiss_index.bin and rag/metadata.pkl in the repository."
+        )
 
     print("Loading FAISS index and metadata...")
     index = faiss.read_index(str(INDEX_PATH))
@@ -180,7 +189,8 @@ def main():
     if index.ntotal != len(metadata):
         raise ValueError(
             f"FAISS/metadata mismatch: {index.ntotal} vectors vs "
-            f"{len(metadata)} metadata records.")
+            f"{len(metadata)} metadata records."
+        )
     if index.ntotal == 0:
         raise ValueError("The FAISS index is empty.")
 
@@ -192,7 +202,8 @@ def main():
         query_vector = embedding_model.encode(
             [question],
             convert_to_numpy=True,
-            normalize_embeddings=True,).astype("float32")
+            normalize_embeddings=True,
+        ).astype("float32")
         scores, indices = index.search(query_vector, min(top_k, index.ntotal))
         retrieved = []
         for score, idx in zip(scores[0], indices[0]):
@@ -208,7 +219,8 @@ def main():
         api_key=api_key,
         base_url=MISTRAL_BASE_URL,
         timeout=120.0,
-        max_retries=4,)
+        max_retries=4,
+    )
 
     # Separate asynchronous client for RAGAS judge calls. This avoids
     # ChatMistralAI's LangChain token-usage aggregation path that failed before.
@@ -216,15 +228,18 @@ def main():
         api_key=api_key,
         base_url=MISTRAL_BASE_URL,
         timeout=180.0,
-        max_retries=4,)
+        max_retries=4,
+    )
     evaluator_llm = llm_factory(
         EVALUATOR_MODEL,
         provider="openai",
-        client=evaluator_client,)
+        client=evaluator_client,
+    )
 
     local_embeddings = LangchainEmbeddingsWrapper(
         LocalSentenceTransformerEmbeddings(embedding_model),
-        run_config=RUN_CONFIG,)
+        run_config=RUN_CONFIG,
+    )
 
     samples = []
     detailed_rows = []
@@ -237,7 +252,8 @@ def main():
             f"[Source: {r.get('source', 'Unknown')} | "
             f"Chunk: {r.get('chunk_id', 'Unknown')}]\n{r.get('text', '')}"
             for r in retrieved
-            if r.get("text")]
+            if r.get("text")
+        ]
 
         prompt = f"""You are LabGuard AI, a laboratory quality document assistant.
 Answer the question using ONLY the information in the retrieved documents.
@@ -263,8 +279,10 @@ ANSWER:
             model=GENERATION_MODEL,
             messages=[
                 {"role": "system", "content": "You are LabGuard AI."},
-                {"role": "user", "content": prompt},],
-            temperature=0,)
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+        )
         answer = completion.choices[0].message.content or ""
         if not answer.strip():
             raise RuntimeError(f"Mistral returned an empty answer for question {number}.")
@@ -274,7 +292,9 @@ ANSWER:
                 user_input=question,
                 response=answer,
                 retrieved_contexts=[r.get("text", "") for r in retrieved if r.get("text")],
-                reference=item["ground_truth"],))
+                reference=item["ground_truth"],
+            )
+        )
 
         retrieved_sources = [r.get("source", "Unknown") for r in retrieved]
         source_hit = item["expected_source"] in retrieved_sources
@@ -284,18 +304,22 @@ ANSWER:
             "expected_source": item["expected_source"],
             "retrieved_sources": " | ".join(str(s) for s in retrieved_sources),
             "expected_source_in_top3": source_hit,
-            "answer": answer,})
+            "answer": answer,
+        })
 
         # Save partial results after each answer, so a later failure does not
         # discard the already generated answers.
         with (OUTPUT_DIR / "answers_and_retrieval.csv").open(
-            "w", newline="", encoding="utf-8-sig") as file:
+            "w", newline="", encoding="utf-8-sig"
+        ) as file:
             writer = csv.DictWriter(file, fieldnames=detailed_rows[0].keys())
             writer.writeheader()
             writer.writerows(detailed_rows)
 
-        print(f"[{number}/{len(EVALUATION_DATA)}] Answer generated; "
-            f"expected source in top 3: {source_hit}")
+        print(
+            f"[{number}/{len(EVALUATION_DATA)}] Answer generated; "
+            f"expected source in top 3: {source_hit}"
+        )
         if number < len(EVALUATION_DATA):
             time.sleep(GENERATION_PAUSE_SECONDS)
 
@@ -308,27 +332,31 @@ ANSWER:
         AnswerRelevancy(llm=evaluator_llm, embeddings=local_embeddings),
         AnswerCorrectness(llm=evaluator_llm, embeddings=local_embeddings),
         ContextPrecision(llm=evaluator_llm),
-        ContextRecall(llm=evaluator_llm),]
+        ContextRecall(llm=evaluator_llm),
+    ]
 
     result = evaluate(
         dataset=evaluation_dataset,
         metrics=metrics,
         run_config=RUN_CONFIG,
         raise_exceptions=True,
-        show_progress=True,)
+        show_progress=True,
+    )
 
     results_df = result.to_pandas()
     results_df.to_csv(
         OUTPUT_DIR / "ragas_metrics_per_question.csv",
         index=False,
-        encoding="utf-8-sig",)
+        encoding="utf-8-sig",
+    )
 
     metric_columns = [
         "faithfulness",
         "answer_relevancy",
         "answer_correctness",
         "context_precision",
-        "context_recall",]
+        "context_recall",
+    ]
     summary = {
         "questions_evaluated": len(samples),
         "top_k": TOP_K,
@@ -338,7 +366,9 @@ ANSWER:
         "ragas_version": "0.4.3",
         "metrics": {},
         "source_hit_rate_at_3": float(
-            np.mean([row["expected_source_in_top3"] for row in detailed_rows])),}
+            np.mean([row["expected_source_in_top3"] for row in detailed_rows])
+        ),
+    }
 
     for metric_name in metric_columns:
         if metric_name not in results_df.columns:
